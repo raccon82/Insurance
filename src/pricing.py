@@ -1,6 +1,8 @@
 """
 Data-driven pricing engine handling exact tier matching, age-banded pricing, 
 occupational class multipliers, GST rules, and Non-Evidence Limit (NEL) underwriting flags.
+Supports insurer-specific age calculation rules (ALB for Singlife & Raffles Health, ANB for HSBC Life) 
+anchored to policy period 1 Oct 2026 - 30 Sep 2027.
 """
 
 import pandas as pd
@@ -12,14 +14,14 @@ from src.calculator import calculate_member_age
 
 def get_sample_rate_tables() -> pd.DataFrame:
     """
-    Generate built-in sample rate tables for Singlife, HSBC, and AIA covering:
+    Generate built-in sample rate tables for Singlife, HSBC Life, and Raffles Health covering:
     - Group Term Life (GTL)
     - Group Living Care (GLC)
     - Group Basic Medical (GBM)
     - Group Major Medical (GMM)
     - Group Personal Accident (GPA)
     
-    Age brackets (Singlife style): 
+    Age brackets: 
     30 & below (0-30), 31-35, 36-40, 41-45, 46-50, 51-55, 56-60, 61-65, 66-70, 71-75.
     """
     brackets = [
@@ -35,12 +37,8 @@ def get_sample_rate_tables() -> pd.DataFrame:
         (71, 75)
     ]
     
-    # Base premiums per bracket for different products and insurers
-    # GTL & GLC rates per S$10,000 or flat per tier, or per S$1,000. Let's make them per tier/flat or unit rates.
-    # To keep it robust and simple for exact tier matching, we define rates per coverage tier or age band.
-    
     data = []
-    insurers = ["Singlife", "HSBC Life", "AIA Corporate"]
+    insurers = ["Singlife", "HSBC Life", "Raffles Health"]
     products = [
         ("Group Term Life", 100000.0, [50.0, 65.0, 90.0, 140.0, 220.0, 350.0, 550.0, 850.0, 1300.0, 1900.0]),
         ("Group Living Care", 50000.0, [40.0, 55.0, 75.0, 110.0, 170.0, 260.0, 400.0, 620.0, 950.0, 1400.0]),
@@ -50,18 +48,16 @@ def get_sample_rate_tables() -> pd.DataFrame:
     ]
     
     for insurer in insurers:
-        # Insurer pricing multiplier variation
         multiplier = 1.0
         if insurer == "HSBC Life":
             multiplier = 1.05
-        elif insurer == "AIA Corporate":
-            multiplier = 0.95
+        elif insurer == "Raffles Health":
+            multiplier = 0.98
             
         for prod, default_cov, bracket_rates in products:
             for idx, (age_min, age_max) in enumerate(brackets):
                 base_rate = bracket_rates[idx] * multiplier
                 
-                # For GPA, add occupational class support or handle in engine
                 if prod == "Group Personal Accident":
                     for occ_class in [1, 2, 3]:
                         occ_mult = 1.0 if occ_class == 1 else (1.3 if occ_class == 2 else 1.8)
@@ -89,7 +85,6 @@ def get_sample_rate_tables() -> pd.DataFrame:
                         "Annual Premium": round(base_rate, 2)
                     })
                     
-                    # Also add Plan 1 / Plan 2 variants if needed
                     data.append({
                         "Insurer": insurer,
                         "Product Type": prod,
@@ -113,29 +108,33 @@ def calculate_member_premium(
 ) -> ComparisonResult:
     """
     Calculate premium for a specific member against an insurer using the rate table DataFrame.
-    Applies:
-    1. Age calculation (ALB/ANB) anchored to renewal date.
-    2. Exact tier / attribute matching (Product Type, Plan Tier / Coverage Amount, Age Band, Gender, Occ Class).
-    3. Occupational class multipliers for GPA.
-    4. GST rules (Life/Living Care are GST-exempt 0%; Medical/Accident include prevailing GST e.g. 9%).
-    5. Non-Evidence Limit (NEL) underwriting checks (> S$150,000 for GTL/GLC).
+    Applies insurer-specific age calculation rules:
+    - Singlife & Raffles Health: ALB (Age Last Birthday)
+    - HSBC Life: ANB (Age Next Birthday)
+    Anchored to 1 Oct 2026 - 30 Sep 2027.
     """
-    # 1. Calculate Age
-    age = calculate_member_age(member.dob, config.age_calculation_method, config.renewal_anchor_date)
+    # Insurer-specific age calculation rule
+    insurer_lower = insurer.lower()
+    if "hsbc" in insurer_lower:
+        age_calc_method = "ANB"
+    else:
+        # Singlife, Raffles Health, or default
+        age_calc_method = "ALB"
+        
+    age = calculate_member_age(member.dob, age_calc_method, config.renewal_anchor_date)
     
-    # 2. Determine GST rate
+    # GST rules
     gst_exempt_products = ["Group Term Life", "Group Living Care"]
     is_gst_exempt = member.product_type in gst_exempt_products
     gst_rate = 0.0 if is_gst_exempt else config.gst_percentage
     
-    # 3. Check Underwriting / NEL
+    # Underwriting / NEL check
     underwriting_flag = "Standard"
     if member.product_type in ["Group Term Life", "Group Living Care"]:
         if member.coverage_amount > config.nel_limit_gtl_glc:
             underwriting_flag = "Subject to Underwriting"
 
-    # 4. Filter Rate Table for Exact Match
-    # Conditions: Insurer, Product Type, Plan Tier (or Coverage Amount), Age between Age Min and Age Max
+    # Filter Rate Table
     filtered = rate_df[
         (rate_df["Insurer"].str.lower() == insurer.lower()) &
         (rate_df["Product Type"].str.lower() == member.product_type.lower())
@@ -148,7 +147,7 @@ def calculate_member_premium(
             plan_tier=member.plan_tier,
             insurer=insurer,
             age=age,
-            age_calculation_type=config.age_calculation_method,
+            age_calculation_type=age_calc_method,
             coverage_amount=member.coverage_amount,
             base_premium=0.0,
             occ_multiplier=1.0,
@@ -173,7 +172,7 @@ def calculate_member_premium(
             plan_tier=member.plan_tier,
             insurer=insurer,
             age=age,
-            age_calculation_type=config.age_calculation_method,
+            age_calculation_type=age_calc_method,
             coverage_amount=member.coverage_amount,
             base_premium=0.0,
             occ_multiplier=1.0,
@@ -182,26 +181,23 @@ def calculate_member_premium(
             gst_amount=0.0,
             total_premium=0.0,
             underwriting_flag="Rate Not Found",
-            error_message=f"Age {age} outside rate table brackets for {insurer}"
+            error_message=f"Age {age} ({age_calc_method}) outside rate table brackets for {insurer}"
         )
         
     # Match Plan Tier or Coverage Amount
-    # If Plan Tier column exists, match plan tier or exact coverage amount
     tier_matched = age_matched[
         (age_matched["Plan Tier"].str.lower() == member.plan_tier.lower()) |
         (age_matched["Coverage Amount"] == member.coverage_amount)
     ]
     
     if tier_matched.empty:
-        # Fallback to closest coverage or first available plan tier if exact match fails, 
-        # but prompt specifies: "Exact tier matching on coverage amounts against rate tables. Do not interpolate... Return 'Rate Not Found'"
         return ComparisonResult(
             member_name=member.name,
             product_type=member.product_type,
             plan_tier=member.plan_tier,
             insurer=insurer,
             age=age,
-            age_calculation_type=config.age_calculation_method,
+            age_calculation_type=age_calc_method,
             coverage_amount=member.coverage_amount,
             base_premium=0.0,
             occ_multiplier=1.0,
@@ -213,15 +209,13 @@ def calculate_member_premium(
             error_message=f"Exact tier '{member.plan_tier}' or coverage {member.coverage_amount} not found for {insurer}"
         )
         
-    # Match Gender if specified ('M', 'F', 'ALL')
     gender_matched = tier_matched[
         (tier_matched["Gender"].str.upper() == "ALL") |
         (tier_matched["Gender"].str.upper() == member.gender.upper())
     ]
     if gender_matched.empty:
-        gender_matched = tier_matched  # fallback to first tier match if gender column is wildcard
+        gender_matched = tier_matched
         
-    # Match Occupation Class if GPA
     row = gender_matched.iloc[0]
     base_premium = float(row["Annual Premium"])
     
@@ -235,16 +229,12 @@ def calculate_member_premium(
             
     adjusted_base_premium = base_premium * occ_multiplier
     
-    # If rate was per unit coverage, scale it if member coverage differs from table unit coverage (if table unit is e.g. per 10k)
-    # Here our rate table has exact annual premium for the coverage amount or unit. Let's support proportional scaling if Coverage Amount differs and table coverage > 0:
     table_cov = float(row.get("Coverage Amount", member.coverage_amount))
     if table_cov > 0 and table_cov != member.coverage_amount:
-        # Scale proportionally
         adjusted_base_premium = adjusted_base_premium * (member.coverage_amount / table_cov)
         
     adjusted_base_premium = round(adjusted_base_premium, 2)
     
-    # Calculate GST
     gst_amount = round(adjusted_base_premium * (gst_rate / 100.0), 2)
     total_premium = round(adjusted_base_premium + gst_amount, 2)
     
@@ -253,8 +243,8 @@ def calculate_member_premium(
         product_type=member.product_type,
         plan_tier=member.plan_tier,
         insurer=insurer,
-            age=age,
-        age_calculation_type=config.age_calculation_method,
+        age=age,
+        age_calculation_type=age_calc_method,
         coverage_amount=member.coverage_amount,
         base_premium=base_premium,
         occ_multiplier=occ_multiplier,
