@@ -63,8 +63,33 @@ def main():
 
     with tab1:
         st.subheader("Employee Member Census")
-        st.markdown("View and manage employee headcount for premium calculations.")
+        st.markdown("Upload employee census list via Excel/CSV or view/edit existing member census below.")
         
+        uploaded_member_file = st.file_uploader("Upload Member Census (Excel/CSV)", type=["xlsx", "csv"], key="member_upload")
+        if uploaded_member_file is not None:
+            try:
+                if uploaded_member_file.name.endswith(".csv"):
+                    df_upload = pd.read_csv(uploaded_member_file)
+                else:
+                    df_upload = pd.read_excel(uploaded_member_file)
+                
+                parsed_members = []
+                for _, row in df_upload.iterrows():
+                    dob_val = pd.to_datetime(row["DOB"]).date() if "DOB" in row else date(1990, 1, 1)
+                    parsed_members.append(Member(
+                        name=str(row.get("Name", "Unknown")),
+                        dob=dob_val,
+                        gender=str(row.get("Gender", "M")),
+                        occupation_class=int(row.get("Occupation Class", 1)),
+                        coverage_amount=float(row.get("Coverage Amount", 100000.0)),
+                        product_type=str(row.get("Product Type", "Group Basic Medical")),
+                        plan_tier=str(row.get("Plan Tier", "Plan 1"))
+                    ))
+                st.session_state.members = parsed_members
+                st.success(f"Successfully loaded {len(parsed_members)} members from upload.")
+            except Exception as e:
+                st.error(f"Error parsing member file: {e}")
+
         member_data = []
         for m in st.session_state.members:
             member_data.append({
